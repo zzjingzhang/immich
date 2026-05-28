@@ -275,4 +275,198 @@ case AssetSyncResult.CHECK_OFFLINE: {
 
 ### 代码原理
 
-资产有 `isOffline` 字段，
+资产有 `isOffline` 字段，`checkExistingAsset()` 根据文件状态返回不同的 `AssetSyncResult`：
+
+```typescript
+export enum AssetSyncResult {
+  DO_NOTHING,   // 0
+  UPDATE,       // 1
+  OFFLINE,      // 2
+  CHECK_OFFLINE, // 3
+}
+```
+
+### 行为分析
+
+| 组件 | 行为 |
+|------|------|
+| **validateImportPath 返回** | `{ isValid: true }`。路径本身有效。 |
+| **update 是否拒绝保存** | ✅ **允许保存**。 |
+| **watch 是否排队** | ✅ **会触发重新扫描**。文件 add/change 事件会触发 `handler`，如果文件不在 exclusionPatterns 中，会排队 `LibrarySyncFiles`。 |
+| **handleQueueSyncFiles 过滤** | ✅ **会过滤已存在的资产**。`filterNewExternalAssetPaths` 会排除数据库中已存在的路径，不管是否 offline。offline 资产路径不会重新排队 import。 |
+| **handleQueueSyncAssets offline/online** | ✅ **会恢复 online（如果条件满足）**。<br>1. `checkExistingAsset()` 对已 offline 且文件存在的资产返回 `CHECK_OFFLINE`<br>2. 检查是否在 importPath 中：如果不在，保持 offline<br>3. 检查是否被 exclusionPatterns 命中：如果命中，保持 offline<br>4. 都通过则标记为 online：`isOffline: false, deletedAt: null` |
+
+### 关键代码验证 - 过滤已存在的资产
+
+```typescript
+// [asset.repository.ts#L1052-L1071](file:///c:/Users/10244/Desktop/0508-under/immich/server/src/repositories/asset.repository.ts#L1052-L1071)
+async filterNewExternalAssetPaths(libraryId: string, paths: string[]): Promise<string[]> {
+  const result = await this.db
+    .selectFrom(unnest(paths).as('path'))
+    .select('path')
+    .where((eb) =>
+      eb.not(
+        eb.exists(
+          this.db
+            .selectFrom('asset')
+            .select('originalPath')
+            .whereRef('asset.originalPath', '=', eb.ref('path'))
+            .where('libraryId', '=', libraryId)
+            .where('isExternal', '=', true),
+        ),
+      ),
+    )
+    .execute();
+  return result.map((row) => row.path);
+}
+```
+
+> **注意**：这个查询不区分 `isOffline` 状态，只要路径存在于 asset 表中就会被过滤。
+
+### 关键代码验证 - offline 转 online
+
+```typescript
+// [library.service.ts#L601-L604](file:///c:/Users/10244/Desktop/0508-under/immich/server/src/services/library.service.ts#L601-L604)
+if (asset.isOffline && asset.status !== AssetStatus.Deleted) {
+  // 只有 offline 且未删除的资产才进行检查
+  return AssetSyncResult.CHECK_OFFLINE;
+}
+
+// [library.service.ts#L553-L555](file:///c:/Users/10244/Desktop/0508-under/immich/server/src/services/library.service.ts#L553-L555)
+if (assetIdsToOnline.length > 0) {
+  promises.push(this.assetRepository.updateAll(assetIdsToOnline, { isOffline: false, deletedAt: null }));
+}
+```
+
+---
+
+## 场景6：路径里出现新文件
+
+### 行为分析
+
+| 组件 | 行为 |
+|------|------|
+| **validateImportPath 返回** | `{ isValid: true }`。路径本身有效。 |
+| **update 是否拒绝保存** | ✅ **允许保存**。 |
+| **watch 是否排队** | ✅ **会排队**。watcher 检测到 `add` 事件，通过 matcher 检查（文件扩展名匹配 + 不被 exclusionPatterns 排除），然后排队 `LibrarySyncFiles`。 |
+| **handleQueueSyncFiles 过滤** | ✅ **会处理新文件**。<br>1. `walk()` 遍历 importPaths，排除 hidden 文件和 exclusionPatterns<br>2. `filterNewExternalAssetPaths()` 过滤已存在的路径<br>3. 新路径排队 `LibrarySyncFiles` 进行 import<br>4. `processEntity()` 创建资产记录，`checksum` 使用 `sha1(path)` |
+| **handleQueueSyncAssets offline/online** | ❌ **不相关**。新文件还没有资产记录，不会进入这个流程。 |
+
+### 关键代码验证 - watcher 触发新文件
+
+```typescript
+// [library.service.ts#L143-L145](file:///c:/Users/10244/Desktop/0508-under/immich/server/src/services/library.service.ts#L143-L145)
+onAdd: (path) => {
+  return handlePromiseError(handler('add', path), this.logger);
+},
+```
+
+### 关键代码验证 - 新文件导入流程
+
+```typescript
+// [library.service.ts#L248-L281](file:///c:/Users/10244/Desktop/0508-under/immich/server/src/services/library.service.ts#L248-L281)
+@OnJob({ name: JobName.LibrarySyncFiles, queue: QueueName.Library })
+async handleSyncFiles(job: JobOf<JobName.LibrarySyncFiles>): Promise<JobStatus> {
+  const assetImports: Insertable<AssetTable>[] = [];
+  await Promise.all(
+    job.paths.map((path) =>
+      this.processEntity(path, library.ownerId, job.libraryId)
+        .then((asset) => assetImports.push(asset))
+        .catch(...)
+    ),
+  );
+
+  const assetIds = await this.assetRepository.createAll(assetImports);
+  await this.queuePostSyncJobs(assetIds); // sidecar discovery, metadata extraction
+  return JobStatus.Success;
+}
+
+// [library.service.ts#L400-L419](file:///c:/Users/10244/Desktop/0508-under/immich/server/src/services/library.service.ts#L400-L419)
+private async processEntity(filePath, ownerId, libraryId) {
+  const assetPath = path.normalize(filePath);
+  const stat = await this.storageRepository.stat(assetPath);
+  return {
+    ownerId,
+    libraryId,
+    checksum: this.cryptoRepository.hashSha1(`path:${assetPath}`),
+    checksumAlgorithm: ChecksumAlgorithm.sha1Path,
+    originalPath: assetPath,
+    fileCreatedAt: stat.mtime,
+    fileModifiedAt: stat.mtime,
+    type: mimeTypes.isVideo(assetPath) ? AssetType.Video : AssetType.Image,
+    originalFileName: parse(assetPath).base,
+    isExternal: true,
+  };
+}
+```
+
+---
+
+## 行为汇总表
+
+| 场景 | validateImportPath | update 拒绝 | watch 排队 | handleQueueSyncFiles 过滤 | handleQueueSyncAssets offline/online |
+|------|-------------------|------------|-----------|-------------------------|--------------------------------------|
+| **Immich 内部路径** | `isValid: false` + 消息 | ✅ 是 | ❌ 否 | ❌ 跳过 | ❌ 不相关 |
+| **相对路径** | `isValid: false` + 消息 | ✅ 是 | ❌ 否 | ❌ 跳过 | ❌ 不相关 |
+| **路径不可读** | `isValid: false` + 消息 | ✅ 是 | ❌ 否（保存前）<br>✅ 跳过（保存后） | ✅ 跳过 | ✅ 文件不存在 → offline |
+| **被 exclusionPatterns 命中** | `isValid: true` | ❌ 否 | ❌ 不触发 import（add/change）<br>✅ 删除仍会触发 | ✅ walk 时排除 | ✅ SQL 匹配 → offline<br>❌ 恢复时仍被排除 → 保持 offline |
+| **已有资产离线** | `isValid: true` | ❌ 否 | ✅ 文件变化会触发 | ✅ 已存在路径被过滤 | ✅ CHECK_OFFLINE → 检查 importPath 和 exclusion → online |
+| **出现新文件** | `isValid: true` | ❌ 否 | ✅ add 事件触发 import | ✅ walk + filterNew → 排队导入 | ❌ 不相关 |
+
+---
+
+## 关键流程图示
+
+### 1. Import Path 验证与保存流程
+
+```
+管理员添加/更新 importPath
+        ↓
+validateImportPath()
+        ├─ 检查 isImmichPath → ❌ 拒绝
+        ├─ 检查 isAbsolute → ❌ 拒绝
+        ├─ 检查 stat() 存在且是目录 → ❌ 拒绝
+        └─ 检查 R_OK 读权限 → ❌ 拒绝
+        ↓
+update() 发现 isValid: false → 抛出 BadRequestException
+        ↓ (验证通过)
+保存到数据库
+        ↓
+watch() 启动文件监控（如果 watch 启用）
+```
+
+### 2. 新文件发现流程
+
+```
+磁盘出现新文件
+        ↓
+watcher onAdd 事件
+        ↓
+picomatch 匹配（扩展名 + exclusionPatterns）
+        └─ 不匹配 → 记录 verbose 日志，忽略
+        ↓
+queue LibrarySyncFiles
+        ↓
+handleSyncFiles → processEntity → createAll → queuePostSyncJobs
+```
+
+### 3. 已有资产状态同步流程
+
+```
+LibrarySyncAssetsQueueAll 触发
+        ↓
+detectOfflineExternalAssets()  [SQL UPDATE]
+        ├─ 不在 importPath 下 → mark offline
+        └─ 匹配 exclusionPatterns → mark offline
+        ↓
+streamAssetIds() 分批处理
+        ↓
+handleSyncAssets
+        ├─ stat() 失败 → OFFLINE
+        ├─ stat() 成功且 isOffline → CHECK_OFFLINE
+        │   ├─ 不在 importPath → 保持 offline
+        │   ├─ 匹配 exclusion → 保持 offline
+        │   └─ ✅ 都通过 → ONLINE
+        ├─ mtime 变化 → UPDATE（重新提取元数据）
+        └─ 其他 → DO_NOTHING
+```
