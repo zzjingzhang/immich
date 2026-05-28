@@ -220,4 +220,48 @@ case JobName.DatabaseBackup: {
    - 确保备份完整性（并发备份可能导致数据不一致）
    - 避免数据库同时承受多个备份的读取压力
 
-**对应 Handler**：[database-backup.service.ts#L92-L106](file:///c:/Users/10244/Desktop/
+**对应 Handler**：[database-backup.service.ts#L92-L106](file:///c:/Users/10244/Desktop/0508-under/immich/server/src/services/database-backup.service.ts#L92-L106)
+
+### 5.3 PersonGenerateThumbnail
+
+```typescript
+case JobName.PersonGenerateThumbnail: {
+  return { priority: 1 };
+}
+```
+
+**特殊行为**：设置优先级为 1（默认优先级为 0，数值越大优先级越高）
+
+**原因分析**：
+
+1. **用户体验敏感**：人物缩略图直接显示在 UI 的"人物"页面，用户打开该页面时期望立即看到人物头像
+2. **与 Asset 缩略图竞争**：`ThumbnailGeneration` 队列中可能有大量普通资产缩略图任务在排队
+3. **高优先级必要性**：
+   - 确保人物缩略图优先生成，提升用户体验
+   - 避免用户看到空白的人物头像占位符
+   - 人物缩略图通常数量远少于资产缩略图，优先处理不会显著影响整体性能
+
+**对应 Handler**：[media.service.ts#L407-L460](file:///c:/Users/10244/Desktop/0508-under/immich/server/src/services/media.service.ts#L407-L460)
+
+### 5.4 其他特殊 JobName 对比
+
+| JobName | 特殊选项 | 目的 |
+|---------|---------|------|
+| `NotifyAlbumUpdate` | `jobId: ${id}/${recipientId}` | 避免重复通知同一用户 |
+| `StorageTemplateMigrationSingle` | `jobId: item.data.id` | 避免同一资产重复迁移 |
+| `VersionCheck` | `deduplication: { id: ... }` | 避免重复版本检查 |
+
+---
+
+## 六、总结
+
+| 机制 | 设计目的 | 代码位置 |
+|------|---------|---------|
+| **重复 Handler 校验** | 确保 job 语义明确，避免冲突 | [job.repository.ts#L53-L60](file:///c:/Users/10244/Desktop/0508-under/immich/server/src/repositories/job.repository.ts#L53-L60) |
+| **缺失 Handler 校验** | 运行时安全，防止 queueAll 失败 | [job.repository.ts#L74-L83](file:///c:/Users/10244/Desktop/0508-under/immich/server/src/repositories/job.repository.ts#L74-L83) |
+| **Handler 反查队列** | 简化 API，调用方无需指定队列 | [job.repository.ts#L155-L157](file:///c:/Users/10244/Desktop/0508-under/immich/server/src/repositories/job.repository.ts#L155-L157) |
+| **FacialRecognitionQueueAll 去重** | 保护 ML 服务和数据库 | [job.repository.ts#L232-L234](file:///c:/Users/10244/Desktop/0508-under/immich/server/src/repositories/job.repository.ts#L232-L234) |
+| **DatabaseBackup 去重** | 保护数据库和磁盘资源 | [job.repository.ts#L238-L240](file:///c:/Users/10244/Desktop/0508-under/immich/server/src/repositories/job.repository.ts#L238-L240) |
+| **PersonGenerateThumbnail 高优先级** | 提升用户体验 | [job.repository.ts#L229-L231](file:///c:/Users/10244/Desktop/0508-under/immich/server/src/repositories/job.repository.ts#L229-L231) |
+
+Immich 的 Job 系统设计体现了**"安全优先"**和**"用户体验优先"**的原则，通过启动时强校验和运行时细粒度控制，确保系统稳定可靠。
